@@ -563,7 +563,7 @@ impl LlamaCppProvider {
             .into_iter()
             .filter_map(|e| {
                 let path = e.get("path")?.as_str()?.to_string();
-                if !path.ends_with(".gguf") {
+                if sanitize_gguf_relative_path(&path).is_err() {
                     return None;
                 }
                 let size = e.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -613,14 +613,16 @@ impl LlamaCppProvider {
     /// `repo_id` is e.g. "bartowski/Llama-3.1-8B-Instruct-GGUF"
     /// `filename` is e.g. "Llama-3.1-8B-Instruct-Q4_K_M.gguf"
     pub fn download_gguf(&self, repo_id: &str, filename: &str) -> Result<PullHandle, String> {
+        let sanitized_filename = sanitize_gguf_relative_path(filename)?;
+        let filename_display = sanitized_filename.to_string_lossy().into_owned();
         let models_dir = self.models_dir.clone();
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
-            repo_id, filename
+            repo_id, filename_display
         );
-        let dest_path = models_dir.join(filename);
-        let tag = format!("{}/{}", repo_id, filename);
-        let filename_owned = filename.to_string();
+        let dest_path = models_dir.join(&sanitized_filename);
+        let tag = format!("{}/{}", repo_id, filename_display);
+        let filename_owned = filename_display;
         let (tx, rx) = std::sync::mpsc::channel();
 
         // Ensure cache directory exists
@@ -754,6 +756,41 @@ impl LlamaCppProvider {
 fn is_split_file(filename: &str) -> bool {
     // Pattern: anything with "-NNNNN-of-NNNNN" before .gguf
     filename.contains("-of-")
+}
+
+/// Validate that a GGUF filename is a safe relative path under the cache dir.
+fn sanitize_gguf_relative_path(filename: &str) -> Result<PathBuf, String> {
+    if filename.is_empty() {
+        return Err("Invalid GGUF filename: empty path".to_string());
+    }
+    if !filename.ends_with(".gguf") {
+        return Err(format!(
+            "Invalid GGUF filename '{}': expected .gguf extension",
+            filename
+        ));
+    }
+
+    let path = PathBuf::from(filename);
+    if path.is_absolute() {
+        return Err(format!(
+            "Invalid GGUF filename '{}': absolute paths are not allowed",
+            filename
+        ));
+    }
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "Invalid GGUF filename '{}': path traversal is not allowed",
+                    filename
+                ));
+            }
+        }
+    }
+
+    Ok(path)
 }
 
 /// Default directory for llama.cpp GGUF model cache.
@@ -1493,5 +1530,44 @@ mod tests {
         let candidates =
             hf_name_to_ollama_candidates("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct");
         assert!(candidates.contains(&"deepseek-coder-v2:16b".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_gguf_relative_path_accepts_regular_filename() {
+        let sanitized = sanitize_gguf_relative_path("Q4_K_M.gguf").unwrap();
+        assert_eq!(sanitized, PathBuf::from("Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn test_sanitize_gguf_relative_path_accepts_nested_relative_path() {
+        let sanitized = sanitize_gguf_relative_path("qwen/Q4_K_M.gguf").unwrap();
+        assert_eq!(sanitized, PathBuf::from("qwen/Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn test_sanitize_gguf_relative_path_rejects_parent_dir_traversal() {
+        assert!(sanitize_gguf_relative_path("../evil.gguf").is_err());
+        assert!(sanitize_gguf_relative_path("../../evil.gguf").is_err());
+        assert!(sanitize_gguf_relative_path("safe/../../evil.gguf").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_gguf_relative_path_rejects_absolute_path() {
+        assert!(sanitize_gguf_relative_path("/tmp/evil.gguf").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_gguf_relative_path_rejects_non_gguf_extension() {
+        assert!(sanitize_gguf_relative_path("model.bin").is_err());
+    }
+
+    #[test]
+    fn test_download_gguf_rejects_traversal_before_network() {
+        let provider = LlamaCppProvider::new();
+        let err = match provider.download_gguf("some/repo", "../../evil.gguf") {
+            Ok(_) => panic!("expected traversal filename to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("path traversal"));
     }
 }
